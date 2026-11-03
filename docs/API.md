@@ -3,7 +3,7 @@
 One JSON API under `/api/*`, loopback :8766 behind Caddy. All state is
 append-only JSONL under `$ACEH_STATE` — there is no database server and no SQLite.
 Datasets are read from a checkout of
-[aceh-nlp-dataset](https://github.com/aceh-nlp/dataset) at `$ACEH_DATASET_ROOT`.
+[aceh-nlp/dataset](https://github.com/aceh-nlp/dataset) at `$ACEH_DATASET_ROOT`.
 
 ## Auth
 
@@ -56,7 +56,7 @@ of speakers; switch on Google Sign-In for verified identities.
 
 - `POST /api/generate` (open) — `{prompt, max_tokens?, temperature?, top_p?, seed?}`
   proxied to `$ACEH_GPU_URL/generate` on the
-  [aceh-nlp-gpu](https://github.com/aceh-nlp/gpu) server
+  [aceh-nlp/gpu](https://github.com/aceh-nlp/gpu) server
   (bearer `$ACEH_GPU_TOKEN` when set). No sign-in needed; anonymous calls are
   capped at 128 tokens, signed-in calls keep their `max_tokens`. Limits:
   `$ACEH_GENERATE_PER_IP` per client IP per hour (default 20, from
