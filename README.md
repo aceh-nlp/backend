@@ -9,7 +9,7 @@ lives in [aceh-nlp/frontend](https://github.com/aceh-nlp/frontend);
 this repository serves no HTML.
 
 Pure Python standard library; no database (JSONL state only, no SQLite).
-Evaluators sign in (email, or Google when configured) and every rating records
+Reviewers sign in with a code sent to their email, and every rating records
 who gave it. Contract: [docs/API.md](docs/API.md).
 
 ## Run
@@ -22,9 +22,14 @@ ACEH_ADMIN_TOKEN=$(openssl rand -hex 32) \
 python3 server.py
 ```
 
-Optional: `ACEH_GPU_URL` + `ACEH_GPU_TOKEN` (inference), `ACEH_GOOGLE_CLIENT_ID`
-(Google Sign-In), `ACEH_SPECIALISTS` (comma-separated emails allowed to review, after
-Google sign-in; restart to apply changes), `ACEH_GENERATE_PER_IP` and
+Sign-in needs `ACEH_CF_ACCOUNT_ID` + `ACEH_CF_EMAIL_TOKEN` (Cloudflare Email Sending; the
+token needs Email Sending: Edit). Without them every sign-in gets a 503.
+
+Optional: `ACEH_GPU_URL` + `ACEH_GPU_TOKEN` (inference), `ACEH_SPECIALISTS`
+(comma-separated emails labelled specialist, who can also upload; restart to apply
+changes), `ACEH_MAIL_FROM` (default `login@aceh-nlp.net`), `ACEH_MAIL_DAILY_CAP` (default
+100), `ACEH_MAIL_PER_IP` (default 30 an hour), `ACEH_REVIEWS_PER_PERSON` and `ACEH_REVIEWS_DAILY_CAP` (default 500 and 5000 a
+day), `ACEH_GENERATE_PER_IP` and
 `ACEH_GENERATE_DAILY_CAP` (public model demo limits, default 20/hour per IP and
 500/day), `ACEH_PORT` (default 8766, loopback only).
 

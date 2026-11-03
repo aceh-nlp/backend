@@ -10,8 +10,14 @@ Env:
   ACEH_ADMIN_TOKEN       bearer token for /api/export — required
   ACEH_GPU_URL           base URL of the aceh-nlp-gpu server (optional)
   ACEH_GPU_TOKEN         bearer token for the gpu server (optional)
-  ACEH_GOOGLE_CLIENT_ID  enables Google Sign-In, which specialists need (optional)
-  ACEH_SPECIALISTS       comma-separated emails allowed to review, after Google sign-in
+  ACEH_SPECIALISTS       comma-separated emails labelled specialist; they can also upload (optional)
+  ACEH_CF_ACCOUNT_ID     Cloudflare account that sends sign-in codes
+  ACEH_CF_EMAIL_TOKEN    Cloudflare API token with Email Sending: Edit
+  ACEH_MAIL_FROM         sender, default login@aceh-nlp.net
+  ACEH_MAIL_DAILY_CAP    sign-in emails per UTC day (default 100)
+  ACEH_MAIL_PER_IP       sign-in emails per visitor per hour (default 30)
+  ACEH_REVIEWS_PER_PERSON  reviews per person per UTC day (default 500)
+  ACEH_REVIEWS_DAILY_CAP   reviews by everyone per UTC day (default 5000)
   ACEH_GENERATE_PER_IP   anonymous /api/generate calls per IP per hour (default 20)
   ACEH_GENERATE_DAILY_CAP  all /api/generate calls per UTC day (default 500)
   ACEH_PORT              listen port, default 8766 (loopback only)
@@ -19,9 +25,12 @@ Env:
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
+import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,15 +41,25 @@ from pathlib import Path
 import storage
 
 # Fields never shown to evaluators (blinding).
-BLINDED_FIELDS = {"model", "revision", "run_id", "source", "generator", "producer"}
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+BLINDED_FIELDS = {"model", "revision", "run_id", "source", "generator", "producer", "uploaded_by"}
+EMAIL_RE = re.compile(r"^[^@\s<>,;:\"'()]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$")
+# A dataset name is folders and a file stem: no dots, so no way out of its folder.
+DATASET_RE = re.compile(r"[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*")
 MAX_UPLOAD_ROWS = 2000
-MAX_BODY = 5 * 1024 * 1024
+MAX_UPLOAD_BODY = 5 * 1024 * 1024
+MAX_BODY = 256 * 1024
+MAX_REVIEW_TEXT = 5000
 # Anonymous generation gets fewer tokens than a signed-in call.
 ANON_MAX_TOKENS = 128
-# What a specialist may submit, besides dataset and item_id.
+# What a reviewer may submit, besides dataset and item_id.
 REVIEW_FIELDS = {"score", "correction", "annotation"}
-REVIEW_CLOSED = "Review is open to specialists for now"
+NOT_REVIEWABLE = "This dataset is not open for review"
+UPLOADS_CLOSED = "Uploads are open to coordinators for now"
+SIGN_IN = "email_code"  # the only sign-in method tokens are accepted from
+CODE_TTL = 600
+CODE_ATTEMPTS = 5
+TOKEN_TTL = 30 * 86400
+CF_API = "https://api.cloudflare.com/client/v4"
 
 
 # ---------- auth ----------
@@ -68,27 +87,106 @@ def read_token(secret, token):
             return None
         profile = json.loads(_unb64(payload))
         return profile if EMAIL_RE.match(profile.get("email", "")) else None
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None
 
 
-def verify_google_token(id_token, client_id):
-    """Verify a Google ID token via Google's tokeninfo endpoint.
+def clean_text(value):
+    """A request's string with unencodable characters dropped; anything else is empty."""
+    return value.encode("utf-8", "ignore").decode() if isinstance(value, str) else ""
 
-    Returns {email, name} or raises ValueError.
+
+def signed_in(prof, now=None):
+    """True for a token from the emailed-code sign-in that has not expired."""
+    now = time.time() if now is None else now
+    return bool(prof) and prof.get("method") == SIGN_IN and now - prof.get("iat", 0) < TOKEN_TTL
+
+
+class SignInCodes:
+    """One-time sign-in codes, in memory: a restart only means asking for a new code.
+
+    Each request gets its own secret challenge, which the code only works with. So
+    someone who knows an address can't guess against, or use up, another person's code.
     """
-    url = "https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode(
-        {"id_token": id_token})
+
+    def __init__(self, secret, daily_cap, per_ip_hour):
+        self.secret, self.daily_cap, self.per_ip_hour = secret, daily_cap, per_ip_hour
+        self.codes, self.sent, self.by_ip = {}, {}, {}
+        self.day, self.day_count = None, 0
+        self.lock = threading.Lock()
+
+    def _digest(self, challenge, code):
+        return hmac.new(self.secret.encode(), f"{challenge}:{code}".encode(),
+                        hashlib.sha256).hexdigest()
+
+    def reserve(self, email, ip_hash, now=None):
+        """Counts one email against the limits. Returns False when over a limit."""
+        now = time.time() if now is None else now
+        with self.lock:
+            day = time.strftime("%Y-%m-%d", time.gmtime(now))
+            if day != self.day:
+                self.day, self.day_count = day, 0
+            sent = [t for t in self.sent.get(email, []) if now - t < 86400]
+            by_ip = [t for t in self.by_ip.get(ip_hash, []) if now - t < 3600]
+            if (self.day_count >= self.daily_cap or len(by_ip) >= self.per_ip_hour
+                    or len(sent) >= 10 or sum(now - t < 3600 for t in sent) >= 5
+                    or (sent and now - sent[-1] < 60)):
+                return False
+            self.sent[email], self.by_ip[ip_hash] = sent + [now], by_ip + [now]
+            self.day_count += 1
+            return True
+
+    def store(self, email, code, now=None):
+        """Remembers a sent code. Returns the challenge that goes with it."""
+        now = time.time() if now is None else now
+        challenge = secrets.token_urlsafe(24)
+        with self.lock:
+            self.codes = {c: e for c, e in self.codes.items() if now < e["expires"]}
+            self.codes[challenge] = {"email": email, "digest": self._digest(challenge, code),
+                                     "expires": now + CODE_TTL, "attempts": 0}
+        return challenge
+
+    def check(self, challenge, code, now=None):
+        """The email, once, for the right code. Too many wrong tries end the challenge."""
+        now = time.time() if now is None else now
+        digest = self._digest(challenge, code)
+        with self.lock:
+            entry = self.codes.get(challenge)
+            if not entry:
+                return None
+            if now >= entry["expires"]:
+                del self.codes[challenge]
+                return None
+            if hmac.compare_digest(digest, entry["digest"]):
+                del self.codes[challenge]
+                return entry["email"]
+            entry["attempts"] += 1
+            if entry["attempts"] >= CODE_ATTEMPTS:
+                del self.codes[challenge]
+            return None
+
+
+def send_code_email(cfg, to, code):
+    minutes = CODE_TTL // 60
+    req = urllib.request.Request(
+        f"{CF_API}/accounts/{cfg['cf_account_id']}/email/sending/send",
+        data=json.dumps({
+            "to": to, "from": cfg["mail_from"], "subject": "Aceh NLP sign-in code",
+            "text": f"Your Aceh NLP sign-in code is {code}. It expires in {minutes} minutes.\n"
+                    f"Kode masuk Aceh NLP Anda: {code}. Kode berlaku {minutes} menit.\n\n"
+                    "If you didn't ask for this, you can ignore this email.\n"
+                    "Jika Anda tidak memintanya, abaikan email ini.\n",
+        }).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {cfg['cf_email_token']}"},
+        method="POST")
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            info = json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Google verification unavailable: {exc}")
-    if info.get("aud") != client_id:
-        raise ValueError("Google token was issued for a different app")
-    if info.get("email_verified") not in ("true", True):
-        raise ValueError("Google account email is not verified")
-    return {"email": info["email"], "name": info.get("name", "")}
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"mail API returned {exc.code}: {exc.read()[:300]!r}")
+    if not (isinstance(result, dict) and result.get("success")):
+        raise ValueError(f"mail API refused: {str(result)[:300]}")
 
 
 # ---------- datasets ----------
@@ -101,7 +199,7 @@ def list_datasets(dataset_root, state_dir):
         if p.name.startswith("."):
             continue
         name = str(p.relative_to(root)).removesuffix(".jsonl")
-        if name.startswith("layer_1_"):  # already specialist-checked
+        if not reviewable(name):
             continue
         rows = storage.read_all(p)
         if rows and all("id" in r for r in rows):
@@ -114,14 +212,12 @@ def list_datasets(dataset_root, state_dir):
 
 
 def load_items(dataset_root, state_dir, dataset):
+    """Rows of a dataset. The caller has checked the name with reviewable()."""
     if dataset.startswith("upload/"):
         path = Path(state_dir) / "uploads" / (dataset.split("/", 1)[1] + ".jsonl")
     else:
         path = Path(dataset_root) / "data" / (dataset + ".jsonl")
-        # stop path escape
-        if not str(path.resolve()).startswith(str((Path(dataset_root) / "data").resolve())):
-            return None
-    rows = storage.read_all(path)
+    rows = [r for r in storage.read_all(path) if isinstance(r, dict) and "id" in r]
     return rows or None
 
 
@@ -132,19 +228,20 @@ def blind(item):
 # ---------- ratings ----------
 
 def tier_of(specialists, prof):
-    """Specialist needs a verified Google sign-in: email sign-in proves nothing."""
-    if prof.get("method") == "google" and prof["email"].lower() in specialists:
+    """A label on the review, from the list. Being signed in proved the email."""
+    if prof["email"].lower() in specialists:
         return "specialist"
     return "everyday"
 
 
-def reviewable(dataset, tier):
-    """Specialists review everything below their own layer; pairs for others come later."""
-    return tier == "specialist" and not dataset.startswith("layer_1_")
+def reviewable(dataset):
+    """A well-formed name, outside layer 1 (the result of review) and raw source files."""
+    return (bool(DATASET_RE.fullmatch(dataset)) and not dataset.startswith("layer_1_")
+            and "/raw/" not in dataset)
 
 
 def validate_rating(body):
-    """Returns ({data, result}, None) for a specialist review, or (None, error)."""
+    """Returns ({data, result}, None) for a review, or (None, error)."""
     if not isinstance(body, dict):
         return None, "Body must be a JSON object"
     dataset, item_id = body.get("dataset"), body.get("item_id")
@@ -160,8 +257,8 @@ def validate_rating(body):
     for opt in ("correction", "annotation"):
         val = body.get(opt)
         if val is not None:
-            if not isinstance(val, str) or len(val) > 20000:
-                return None, f"'{opt}' must be a string under 20000 characters"
+            if not isinstance(val, str) or len(val) > MAX_REVIEW_TEXT:
+                return None, f"'{opt}' must be a string under {MAX_REVIEW_TEXT} characters"
             result[opt] = val
     return {"data": {"dataset": dataset, "item_id": item_id}, "result": result}, None
 
@@ -213,11 +310,49 @@ class GenerateLimiter:
         return None
 
 
+class ReviewLimiter:
+    """In-memory per-person and global daily limits for stored reviews."""
+
+    def __init__(self, per_person_day, daily_cap):
+        self.per_person_day, self.daily_cap = per_person_day, daily_cap
+        self.day, self.by_person, self.total = None, {}, 0
+        self.lock = threading.Lock()
+
+    def check(self, email, now=None):
+        """True when allowed, and counts the review."""
+        now = time.time() if now is None else now
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        with self.lock:
+            if day != self.day:
+                self.day, self.by_person, self.total = day, {}, 0
+            if self.total >= self.daily_cap or self.by_person.get(email, 0) >= self.per_person_day:
+                return False
+            self.by_person[email] = self.by_person.get(email, 0) + 1
+            self.total += 1
+            return True
+
+
 # ---------- server ----------
+
+def guarded(handler):
+    """Any failure gets a JSON reply, rather than a dropped connection."""
+    def run(self):
+        try:
+            handler(self)
+        except Exception as exc:
+            print(f"{self.path.split('?')[0]} failed: {type(exc).__name__}", flush=True)
+            try:
+                self._send(500, {"error": "Something went wrong"})
+            except OSError:
+                pass
+    return run
+
 
 def build_handler(cfg):
     secret = cfg["auth_secret"]
     limiter = GenerateLimiter(cfg.get("generate_per_ip", 20), cfg.get("generate_daily_cap", 500))
+    codes = SignInCodes(secret, cfg.get("mail_daily_cap", 100), cfg.get("mail_per_ip", 30))
+    review_limit = ReviewLimiter(cfg.get("reviews_per_person", 500), cfg.get("reviews_daily_cap", 5000))
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, payload):
@@ -232,31 +367,34 @@ def build_handler(cfg):
             print(f"{self.address_string()} {fmt % args}")
 
         def _body(self):
+            limit = MAX_UPLOAD_BODY if self.path == "/api/uploads" else MAX_BODY
             length = int(self.headers.get("Content-Length", 0))
-            if length > MAX_BODY:
-                raise ValueError(f"Body over {MAX_BODY} bytes")
+            if length > limit:
+                raise ValueError(f"Body over {limit} bytes")
             return json.loads(self.rfile.read(length) or b"{}")
 
         def _evaluator(self):
             auth = self.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
-                return read_token(secret, auth[7:])
+                prof = read_token(secret, auth[7:])
+                return prof if signed_in(prof) else None
             return None
 
         def _ip_hash(self):
-            # Behind Caddy every connection is loopback; the real address is forwarded.
-            forwarded = self.headers.get("X-Forwarded-For", "")
+            # The Worker names the visitor, since Caddy's X-Forwarded-For would only name the
+            # Worker. Direct callers can fake this, so per-visitor limits are never the only limit.
+            forwarded = (self.headers.get("X-Aceh-Client-IP")
+                         or self.headers.get("X-Forwarded-For", ""))
             ip = forwarded.split(",")[0].strip() or self.client_address[0]
             return hashlib.sha256(f"{secret}:{ip}".encode()).hexdigest()[:16]
 
         # ----- GET -----
+        @guarded
         def do_GET(self):
             url = urllib.parse.urlparse(self.path)
             q = dict(urllib.parse.parse_qsl(url.query))
             if url.path == "/api/health":
-                self._send(200, {"ok": True,
-                                 "google_client_id": cfg.get("google_client_id"),
-                                 "gpu": self._gpu_health()})
+                self._send(200, {"ok": True, "gpu": self._gpu_health()})
             elif url.path == "/api/me":
                 prof = self._evaluator()
                 if prof:
@@ -288,8 +426,8 @@ def build_handler(cfg):
                 self._send(401, {"error": "Sign in first"})
                 return
             dataset = q.get("dataset", "")
-            if not reviewable(dataset, tier_of(cfg["specialists"], prof)):
-                self._send(403, {"error": REVIEW_CLOSED})
+            if not reviewable(dataset):
+                self._send(403, {"error": NOT_REVIEWABLE})
                 return
             items = load_items(cfg["dataset_root"], cfg["state"], dataset)
             if items is None:
@@ -311,14 +449,24 @@ def build_handler(cfg):
             self._send(200, {"dataset": dataset, "ratings": storage.read_all(path)})
 
         # ----- POST -----
+        @guarded
         def do_POST(self):
+            # Only a signed-in person gets a large body read.
+            if self.path == "/api/uploads" and not self._evaluator():
+                self._send(401, {"error": "Sign in first"})
+                return
             try:
                 body = self._body()
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, RecursionError) as exc:
                 self._send(400, {"error": f"Invalid JSON body: {exc}"})
                 return
-            if self.path == "/api/login":
-                self._login(body)
+            if not isinstance(body, dict):
+                self._send(400, {"error": "Body must be a JSON object"})
+                return
+            if self.path == "/api/login/start":
+                self._login_start(body)
+            elif self.path == "/api/login/verify":
+                self._login_verify(body)
             elif self.path == "/api/ratings":
                 self._rate(body)
             elif self.path == "/api/uploads":
@@ -328,27 +476,37 @@ def build_handler(cfg):
             else:
                 self._send(404, {"error": "Unknown path"})
 
-        def _login(self, body):
-            if body.get("google_id_token"):
-                if not cfg.get("google_client_id"):
-                    self._send(400, {"error": "Google Sign-In is not configured"})
-                    return
-                try:
-                    ident = verify_google_token(body["google_id_token"], cfg["google_client_id"])
-                except ValueError as exc:
-                    self._send(401, {"error": str(exc)})
-                    return
-                profile = {"email": ident["email"], "name": ident["name"],
-                           "dialect": str(body.get("dialect", ""))[:100],
-                           "method": "google", "iat": int(time.time())}
-            else:
-                email = str(body.get("email", "")).strip().lower()
-                if not EMAIL_RE.match(email):
-                    self._send(400, {"error": "A valid email is required"})
-                    return
-                profile = {"email": email, "name": str(body.get("name", ""))[:200],
-                           "dialect": str(body.get("dialect", ""))[:100],
-                           "method": "email", "iat": int(time.time())}
+        def _login_start(self, body):
+            if not (cfg.get("send_mail") or (cfg.get("cf_account_id") and cfg.get("cf_email_token"))):
+                self._send(503, {"error": "Email sign-in is not set up yet"})
+                return
+            email = clean_text(body.get("email")).strip().lower()
+            if len(email) > 254 or not EMAIL_RE.match(email):
+                self._send(400, {"error": "A valid email is required"})
+                return
+            if not codes.reserve(email, self._ip_hash()):
+                self._send(429, {"error": "Too many codes for now; try again later"})
+                return
+            code = f"{secrets.randbelow(10**6):06d}"
+            try:
+                cfg.get("send_mail", send_code_email)(cfg, email, code)
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                print(f"sign-in email failed: {exc}", flush=True)
+                self._send(502, {"error": "The email could not be sent; try again later"})
+                return
+            self._send(200, {"challenge": codes.store(email, code)})
+
+        def _login_verify(self, body):
+            code = clean_text(body.get("code")).strip()
+            email = None
+            if re.fullmatch(r"[0-9]{6}", code):
+                email = codes.check(clean_text(body.get("challenge")), code)
+            if not email:
+                self._send(401, {"error": "That code is wrong or has expired"})
+                return
+            profile = {"email": email, "name": clean_text(body.get("name"))[:200],
+                       "dialect": clean_text(body.get("dialect"))[:100],
+                       "method": SIGN_IN, "iat": int(time.time())}
             self._send(200, {"token": make_token(secret, profile), "profile": profile})
 
         def _rate(self, body):
@@ -362,13 +520,16 @@ def build_handler(cfg):
                 self._send(400, {"error": err})
                 return
             data = review["data"]
-            if not reviewable(data["dataset"], tier):
-                self._send(403, {"error": REVIEW_CLOSED})
+            if not reviewable(data["dataset"]):
+                self._send(403, {"error": NOT_REVIEWABLE})
                 return
             items = load_items(cfg["dataset_root"], cfg["state"], data["dataset"]) or []
             item = next((i for i in items if i.get("id") == data["item_id"]), None)
             if item is None:
                 self._send(404, {"error": f"Unknown item '{data['item_id']}'"})
+                return
+            if not review_limit.check(prof["email"]):
+                self._send(429, {"error": "That is a lot of reviews for one day; try again tomorrow"})
                 return
             data["sha256"] = row_sha256(item)
             path = Path(cfg["state"]) / "ratings" / (safe_name(data["dataset"]) + ".jsonl")
@@ -384,6 +545,9 @@ def build_handler(cfg):
             if not prof:
                 self._send(401, {"error": "Sign in first"})
                 return
+            if tier_of(cfg["specialists"], prof) != "specialist":
+                self._send(403, {"error": UPLOADS_CLOSED})
+                return
             name, rows = body.get("name"), body.get("rows")
             if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name):
                 self._send(400, {"error": "'name' must match [A-Za-z0-9_-]{1,80}"})
@@ -397,7 +561,7 @@ def build_handler(cfg):
                                                       for v in r.values()):
                     self._send(400, {"error": f"Row {n + 1} is empty or not an object"})
                     return
-                clean.append({"id": str(r.get("id") or f"{name}_{n + 1:04d}"), **r})
+                clean.append({**r, "id": str(r.get("id") or f"{name}_{n + 1:04d}")})
             if len({r["id"] for r in clean}) != len(clean):
                 self._send(400, {"error": "Duplicate ids in upload"})
                 return
@@ -444,7 +608,8 @@ def build_handler(cfg):
                     self._send(200, json.loads(resp.read()))
             except urllib.error.HTTPError as exc:
                 try:
-                    self._send(exc.code, json.loads(exc.read()))
+                    # The GPU's 401 is about our token, and must not read as the visitor's.
+                    self._send(502 if exc.code == 401 else exc.code, json.loads(exc.read()))
                 except json.JSONDecodeError:
                     self._send(502, {"error": f"GPU server error {exc.code}"})
             except (urllib.error.URLError, OSError) as exc:
@@ -460,7 +625,13 @@ def config_from_env():
            "admin_token": os.environ.get("ACEH_ADMIN_TOKEN"),
            "gpu_url": os.environ.get("ACEH_GPU_URL"),
            "gpu_token": os.environ.get("ACEH_GPU_TOKEN"),
-           "google_client_id": os.environ.get("ACEH_GOOGLE_CLIENT_ID"),
+           "cf_account_id": os.environ.get("ACEH_CF_ACCOUNT_ID"),
+           "cf_email_token": os.environ.get("ACEH_CF_EMAIL_TOKEN"),
+           "mail_from": os.environ.get("ACEH_MAIL_FROM", "login@aceh-nlp.net"),
+           "mail_daily_cap": int(os.environ.get("ACEH_MAIL_DAILY_CAP", "100")),
+           "mail_per_ip": int(os.environ.get("ACEH_MAIL_PER_IP", "30")),
+           "reviews_per_person": int(os.environ.get("ACEH_REVIEWS_PER_PERSON", "500")),
+           "reviews_daily_cap": int(os.environ.get("ACEH_REVIEWS_DAILY_CAP", "5000")),
            "generate_per_ip": int(os.environ.get("ACEH_GENERATE_PER_IP", "20")),
            "generate_daily_cap": int(os.environ.get("ACEH_GENERATE_DAILY_CAP", "500")),
            "specialists": {e.strip().lower()
