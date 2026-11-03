@@ -1,0 +1,15 @@
+[Unit]
+Description=Aceh NLP backend API
+After=network.target
+
+[Service]
+Type=simple
+User=cat
+WorkingDirectory=/home/cat/aceh-nlp-backend
+ExecStart=/usr/bin/python3 /home/cat/aceh-nlp-backend/server.py
+EnvironmentFile=/home/cat/aceh-nlp-state/env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

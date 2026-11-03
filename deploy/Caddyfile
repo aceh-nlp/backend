@@ -1,0 +1,12 @@
+# Aceh NLP: static frontend + API proxy. TLS via sslip.io hostname.
+aceh-evaluator.157-245-144-73.sslip.io {
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8766
+	}
+	# The landing page at / may be indexed; the tool under /app/ may not.
+	header /app/* X-Robots-Tag "noindex, nofollow"
+	handle {
+		root * /home/cat/aceh-nlp-frontend
+		file_server
+	}
+}
