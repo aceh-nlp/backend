@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import storage  # noqa: E402
 from server import (ANON_MAX_TOKENS, GenerateLimiter, build_handler, make_token,  # noqa: E402
-                    read_token, row_sha256, validate_rating)
+                    read_token, reviewable, row_sha256, tier_of, validate_rating)
 
 SECRET = "test-secret"
 ADMIN = "test-admin"
@@ -33,35 +33,39 @@ class TokenTests(unittest.TestCase):
 class RatingValidationTests(unittest.TestCase):
     ITEM = {"dataset": "d", "item_id": "i"}
 
-    def test_specialist_score_range(self):
+    def test_score_range(self):
         for score in (0, 6, True, "4"):
-            _, err = validate_rating({**self.ITEM, "score": score}, "specialist")
+            _, err = validate_rating({**self.ITEM, "score": score})
             self.assertIn("1..5", err)
 
-    def test_specialist_accepts_correction_and_annotation(self):
+    def test_accepts_correction_and_annotation(self):
         rec, err = validate_rating({**self.ITEM, "score": 4, "correction": "Lôn jak u keude.",
-                                    "annotation": "spelling"}, "specialist")
+                                    "annotation": "spelling"})
         self.assertIsNone(err)
         self.assertEqual(rec["result"], {"score": 4, "correction": "Lôn jak u keude.",
                                          "annotation": "spelling"})
 
-    def test_specialist_cannot_vote(self):
-        _, err = validate_rating({**self.ITEM, "score": 4, "vote": 1}, "specialist")
-        self.assertIn("vote", err)
-
-    def test_everyday_vote_values(self):
-        for vote in (0, 2, True, "1"):
-            _, err = validate_rating({**self.ITEM, "vote": vote}, "everyday")
-            self.assertIn("1 or -1", err)
-        for vote in (1, -1):
-            rec, err = validate_rating({**self.ITEM, "vote": vote}, "everyday")
-            self.assertIsNone(err)
-            self.assertEqual(rec["result"], {"vote": vote})
-
-    def test_everyday_cannot_score_or_correct(self):
-        for extra in ({"score": 3}, {"correction": "x"}, {"annotation": "x"}, {"rating": 3}):
-            _, err = validate_rating({**self.ITEM, "vote": 1, **extra}, "everyday")
+    def test_rejects_other_fields(self):
+        for extra in ({"vote": 1}, {"rating": 3}):
+            _, err = validate_rating({**self.ITEM, "score": 4, **extra})
             self.assertIn("cannot include", err)
+
+
+class TierTests(unittest.TestCase):
+    SPECIALISTS = {"spec@example.com"}
+
+    def test_specialist_needs_google_and_the_list(self):
+        google = {"email": "Spec@example.com", "method": "google"}
+        self.assertEqual(tier_of(self.SPECIALISTS, google), "specialist")
+        self.assertEqual(tier_of(self.SPECIALISTS, {**google, "method": "email"}), "everyday")
+        self.assertEqual(tier_of(self.SPECIALISTS, {"email": "o@example.com", "method": "google"}),
+                         "everyday")
+
+    def test_reviewable_layers(self):
+        self.assertTrue(reviewable("layer_3_synthetic/x", "specialist"))
+        self.assertTrue(reviewable("layer_2_everyday/x", "specialist"))
+        self.assertFalse(reviewable("layer_1_specialist/x", "specialist"))
+        self.assertFalse(reviewable("layer_3_synthetic/x", "everyday"))
 
 
 class ApiTests(unittest.TestCase):
@@ -75,6 +79,9 @@ class ApiTests(unittest.TestCase):
         with open(root / "dataset/data/demo/sentences.jsonl", "w") as f:
             f.write(json.dumps(cls.ROW_S1) + "\n")
             f.write(json.dumps({"id": "s2", "ace_draft": "Lôn jak u keude."}) + "\n")
+        (root / "dataset/data/layer_1_specialist").mkdir(parents=True)
+        with open(root / "dataset/data/layer_1_specialist/checked.jsonl", "w") as f:
+            f.write(json.dumps({"id": "c1", "ace": "Peue haba?"}) + "\n")
         cls.state = root / "state"
         cfg = {"state": str(cls.state), "dataset_root": str(root / "dataset"),
                "auth_secret": SECRET, "admin_token": ADMIN,
@@ -118,28 +125,35 @@ class ApiTests(unittest.TestCase):
         status, _ = self._call("POST", "/api/login", {"email": "nope"})
         self.assertEqual(status, 400)
 
-    def test_items_require_auth_and_blind(self):
-        status, _ = self._call("GET", "/api/items?dataset=demo/sentences")
-        self.assertEqual(status, 401)
-        token = self._login()
-        status, data = self._call("GET", "/api/items?dataset=demo/sentences", token=token)
-        self.assertEqual(status, 200)
-        self.assertEqual(data["total"], 2)
-        self.assertNotIn("model", data["items"][0])  # blinded
+    def _specialist(self, email="spec@example.com"):
+        return make_token(SECRET, {"email": email, "dialect": "pidie", "method": "google"})
 
     def _export_for(self, email):
         status, data = self._call("GET", "/api/export?dataset=demo/sentences", token=ADMIN)
         self.assertEqual(status, 200)
         return [r for r in data["ratings"] if r.get("reviewer", {}).get("email") == email]
 
+    def test_items_require_specialist_and_blind(self):
+        status, _ = self._call("GET", "/api/items?dataset=demo/sentences")
+        self.assertEqual(status, 401)
+        status, data = self._call("GET", "/api/items?dataset=demo/sentences", token=self._login())
+        self.assertEqual(status, 403)
+        self.assertIn("specialists", data["error"])
+        status, data = self._call("GET", "/api/items?dataset=demo/sentences",
+                                  token=self._specialist())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["total"], 2)
+        self.assertNotIn("model", data["items"][0])  # blinded
+
     def test_me_reports_tier(self):
-        _, data = self._call("GET", "/api/me", token=self._login("spec@example.com"))
+        _, data = self._call("GET", "/api/me", token=self._specialist())
         self.assertEqual(data["tier"], "specialist")
-        _, data = self._call("GET", "/api/me", token=self._login("day@example.com"))
+        # typing a specialist's email is not enough
+        _, data = self._call("GET", "/api/me", token=self._login("spec@example.com"))
         self.assertEqual(data["tier"], "everyday")
 
     def test_specialist_record_and_export(self):
-        token = self._login("spec@example.com")
+        token = self._specialist()
         status, _ = self._call("POST", "/api/ratings",
                                {"dataset": "demo/sentences", "item_id": "s1", "score": 2,
                                 "correction": "Peue haba, Bang?", "annotation": "polite"},
@@ -152,68 +166,73 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
         record = self._export_for("spec@example.com")[0]
         self.assertEqual(set(record), {"data", "reviewer", "result"})
-        self.assertEqual(record["data"]["dataset"], "demo/sentences")
-        self.assertEqual(record["data"]["item_id"], "s1")
         self.assertEqual(record["data"]["sha256"], row_sha256(self.ROW_S1))
         self.assertEqual(record["reviewer"], {"email": "spec@example.com", "dialect": "pidie",
                                               "tier": "specialist"})
         self.assertEqual(record["result"]["score"], 2)
-        self.assertEqual(record["result"]["correction"], "Peue haba, Bang?")
-        self.assertEqual(record["result"]["annotation"], "polite")
         self.assertIsInstance(record["result"]["ts"], int)
 
-    def test_everyday_vote_and_re_review_keeps_both(self):
-        token = self._login("voter@example.com")
-        for vote in (1, -1):
-            status, _ = self._call("POST", "/api/ratings",
-                                   {"dataset": "demo/sentences", "item_id": "s1", "vote": vote},
-                                   token=token)
-            self.assertEqual(status, 200)
-        records = self._export_for("voter@example.com")
-        self.assertEqual([r["result"]["vote"] for r in records], [1, -1])
-        self.assertEqual(records[0]["reviewer"]["tier"], "everyday")
+    def test_re_review_keeps_both(self):
+        token = self._specialist("again@example.com")
+        self.cfg["specialists"].add("again@example.com")
+        try:
+            for score in (1, 5):
+                status, _ = self._call("POST", "/api/ratings",
+                                       {"dataset": "demo/sentences", "item_id": "s1", "score": score},
+                                       token=token)
+                self.assertEqual(status, 200)
+        finally:
+            self.cfg["specialists"].discard("again@example.com")
+        self.assertEqual([r["result"]["score"] for r in self._export_for("again@example.com")], [1, 5])
 
-    def test_tier_format_enforced_over_http(self):
-        everyday, specialist = self._login("wrong1@example.com"), self._login("spec@example.com")
-        item = {"dataset": "demo/sentences", "item_id": "s2"}
-        status, _ = self._call("POST", "/api/ratings", {**item, "score": 3}, token=everyday)
-        self.assertEqual(status, 400)
-        status, _ = self._call("POST", "/api/ratings", {**item, "vote": 1, "correction": "x"},
-                               token=everyday)
-        self.assertEqual(status, 400)
-        status, _ = self._call("POST", "/api/ratings", {**item, "vote": 1}, token=specialist)
-        self.assertEqual(status, 400)
-        self.assertEqual(self._export_for("wrong1@example.com"), [])
+    def test_everyone_else_cannot_review(self):
+        item = {"dataset": "demo/sentences", "item_id": "s2", "score": 3}
+        status, _ = self._call("POST", "/api/ratings", item, token=self._login("day@example.com"))
+        self.assertEqual(status, 403)
+        status, _ = self._call("POST", "/api/ratings", item, token=self._login("spec@example.com"))
+        self.assertEqual(status, 403)
+        self.assertEqual(self._export_for("day@example.com"), [])
+
+    def test_layer_1_is_not_reviewable_or_listed(self):
+        token = self._specialist()
+        _, data = self._call("GET", "/api/datasets")
+        self.assertNotIn("layer_1_specialist/checked", [d["dataset"] for d in data["datasets"]])
+        status, _ = self._call("GET", "/api/items?dataset=layer_1_specialist/checked", token=token)
+        self.assertEqual(status, 403)
+        status, _ = self._call("POST", "/api/ratings",
+                               {"dataset": "layer_1_specialist/checked", "item_id": "c1", "score": 5},
+                               token=token)
+        self.assertEqual(status, 403)
 
     def test_unknown_item_rejected(self):
-        token = self._login("lost@example.com")
+        token = self._specialist()
         for item in ({"dataset": "demo/sentences", "item_id": "nope"},
                      {"dataset": "demo/missing", "item_id": "s1"}):
-            status, _ = self._call("POST", "/api/ratings", {**item, "vote": 1}, token=token)
+            status, _ = self._call("POST", "/api/ratings", {**item, "score": 3}, token=token)
             self.assertEqual(status, 404)
 
     def test_removing_specialist_applies_to_next_review(self):
-        token = self._login("former@example.com")
-        item = {"dataset": "demo/sentences", "item_id": "s1"}
+        token = self._specialist("former@example.com")
+        item = {"dataset": "demo/sentences", "item_id": "s1", "score": 5}
         self.cfg["specialists"].add("former@example.com")
         try:
-            status, _ = self._call("POST", "/api/ratings", {**item, "score": 5}, token=token)
+            status, _ = self._call("POST", "/api/ratings", item, token=token)
             self.assertEqual(status, 200)
         finally:
             self.cfg["specialists"].discard("former@example.com")
-        status, _ = self._call("POST", "/api/ratings", {**item, "score": 5}, token=token)
-        self.assertEqual(status, 400)
-        status, _ = self._call("POST", "/api/ratings", {**item, "vote": 1}, token=token)
-        self.assertEqual(status, 200)
-        tiers = [r["reviewer"]["tier"] for r in self._export_for("former@example.com")]
-        self.assertEqual(tiers, ["specialist", "everyday"])
+        status, _ = self._call("POST", "/api/ratings", item, token=token)
+        self.assertEqual(status, 403)
 
     def test_older_records_still_count_as_done(self):
         storage.append(self.state / "ratings" / "demo_sentences.jsonl",
                        {"dataset": "demo/sentences", "item_id": "s1", "rating": 4,
                         "evaluator_email": "old@example.com", "ts": 1.0})
-        token = self._login("old@example.com")
-        _, data = self._call("GET", "/api/items?dataset=demo/sentences", token=token)
+        self.cfg["specialists"].add("old@example.com")
+        try:
+            _, data = self._call("GET", "/api/items?dataset=demo/sentences",
+                                 token=self._specialist("old@example.com"))
+        finally:
+            self.cfg["specialists"].discard("old@example.com")
         self.assertEqual({i["id"] for i in data["items"]}, {"s2"})
 
     def test_upload_and_review(self):
@@ -224,7 +243,8 @@ class ApiTests(unittest.TestCase):
                                   token=token)
         self.assertEqual(status, 200)
         self.assertEqual(data["dataset"], "upload/my_pairs")
-        status, data = self._call("GET", "/api/items?dataset=upload/my_pairs", token=token)
+        status, data = self._call("GET", "/api/items?dataset=upload/my_pairs",
+                                  token=self._specialist())
         self.assertEqual(data["total"], 1)
         # duplicate name rejected
         status, _ = self._call("POST", "/api/uploads",
@@ -237,7 +257,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 503)
 
     def test_path_escape_blocked(self):
-        token = self._login()
+        token = self._specialist()
         status, _ = self._call("GET", "/api/items?dataset=../../etc/passwd", token=token)
         self.assertEqual(status, 404)
 

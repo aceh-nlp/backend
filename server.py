@@ -10,8 +10,8 @@ Env:
   ACEH_ADMIN_TOKEN       bearer token for /api/export — required
   ACEH_GPU_URL           base URL of the aceh-nlp-gpu server (optional)
   ACEH_GPU_TOKEN         bearer token for the gpu server (optional)
-  ACEH_GOOGLE_CLIENT_ID  enables Google Sign-In verification (optional)
-  ACEH_SPECIALISTS       comma-separated specialist emails (optional)
+  ACEH_GOOGLE_CLIENT_ID  enables Google Sign-In, which specialists need (optional)
+  ACEH_SPECIALISTS       comma-separated emails allowed to review, after Google sign-in
   ACEH_GENERATE_PER_IP   anonymous /api/generate calls per IP per hour (default 20)
   ACEH_GENERATE_DAILY_CAP  all /api/generate calls per UTC day (default 500)
   ACEH_PORT              listen port, default 8766 (loopback only)
@@ -38,8 +38,9 @@ MAX_UPLOAD_ROWS = 2000
 MAX_BODY = 5 * 1024 * 1024
 # Anonymous generation gets fewer tokens than a signed-in call.
 ANON_MAX_TOKENS = 128
-# What each reviewer tier may submit, besides dataset and item_id.
-TIER_FIELDS = {"specialist": {"score", "correction", "annotation"}, "everyday": {"vote"}}
+# What a specialist may submit, besides dataset and item_id.
+REVIEW_FIELDS = {"score", "correction", "annotation"}
+REVIEW_CLOSED = "Review is open to specialists for now"
 
 
 # ---------- auth ----------
@@ -99,9 +100,12 @@ def list_datasets(dataset_root, state_dir):
     for p in sorted(root.rglob("*.jsonl")):
         if p.name.startswith("."):
             continue
+        name = str(p.relative_to(root)).removesuffix(".jsonl")
+        if name.startswith("layer_1_"):  # already specialist-checked
+            continue
         rows = storage.read_all(p)
         if rows and all("id" in r for r in rows):
-            sets.append({"dataset": str(p.relative_to(root)).removesuffix(".jsonl"),
+            sets.append({"dataset": name,
                          "rows": len(rows), "origin": "dataset"})
     for p in sorted((Path(state_dir) / "uploads").glob("*.jsonl")):
         rows = storage.read_all(p)
@@ -127,36 +131,38 @@ def blind(item):
 
 # ---------- ratings ----------
 
-def tier_of(specialists, email):
-    return "specialist" if email.lower() in specialists else "everyday"
+def tier_of(specialists, prof):
+    """Specialist needs a verified Google sign-in: email sign-in proves nothing."""
+    if prof.get("method") == "google" and prof["email"].lower() in specialists:
+        return "specialist"
+    return "everyday"
 
 
-def validate_rating(body, tier):
-    """Returns ({data, result}, None) for this tier's format, or (None, error)."""
+def reviewable(dataset, tier):
+    """Specialists review everything below their own layer; pairs for others come later."""
+    return tier == "specialist" and not dataset.startswith("layer_1_")
+
+
+def validate_rating(body):
+    """Returns ({data, result}, None) for a specialist review, or (None, error)."""
     if not isinstance(body, dict):
         return None, "Body must be a JSON object"
     dataset, item_id = body.get("dataset"), body.get("item_id")
     if not isinstance(dataset, str) or not isinstance(item_id, str):
         return None, "'dataset' and 'item_id' are required strings"
-    extra = set(body) - {"dataset", "item_id"} - TIER_FIELDS[tier]
+    extra = set(body) - {"dataset", "item_id"} - REVIEW_FIELDS
     if extra:
-        return None, f"{tier} reviews cannot include: {', '.join(sorted(extra))}"
-    if tier == "specialist":
-        score = body.get("score")
-        if type(score) is not int or not 1 <= score <= 5:
-            return None, "'score' must be an integer 1..5"
-        result = {"score": score}
-        for opt in ("correction", "annotation"):
-            val = body.get(opt)
-            if val is not None:
-                if not isinstance(val, str) or len(val) > 20000:
-                    return None, f"'{opt}' must be a string under 20000 characters"
-                result[opt] = val
-    else:
-        vote = body.get("vote")
-        if type(vote) is not int or vote not in (1, -1):
-            return None, "'vote' must be 1 or -1"
-        result = {"vote": vote}
+        return None, f"Reviews cannot include: {', '.join(sorted(extra))}"
+    score = body.get("score")
+    if type(score) is not int or not 1 <= score <= 5:
+        return None, "'score' must be an integer 1..5"
+    result = {"score": score}
+    for opt in ("correction", "annotation"):
+        val = body.get(opt)
+        if val is not None:
+            if not isinstance(val, str) or len(val) > 20000:
+                return None, f"'{opt}' must be a string under 20000 characters"
+            result[opt] = val
     return {"data": {"dataset": dataset, "item_id": item_id}, "result": result}, None
 
 
@@ -255,7 +261,7 @@ def build_handler(cfg):
                 prof = self._evaluator()
                 if prof:
                     self._send(200, {"profile": prof,
-                                     "tier": tier_of(cfg["specialists"], prof["email"])})
+                                     "tier": tier_of(cfg["specialists"], prof)})
                 else:
                     self._send(401, {"error": "Sign in first"})
             elif url.path == "/api/datasets":
@@ -282,6 +288,9 @@ def build_handler(cfg):
                 self._send(401, {"error": "Sign in first"})
                 return
             dataset = q.get("dataset", "")
+            if not reviewable(dataset, tier_of(cfg["specialists"], prof)):
+                self._send(403, {"error": REVIEW_CLOSED})
+                return
             items = load_items(cfg["dataset_root"], cfg["state"], dataset)
             if items is None:
                 self._send(404, {"error": f"Unknown dataset '{dataset}'"})
@@ -347,12 +356,15 @@ def build_handler(cfg):
             if not prof:
                 self._send(401, {"error": "Sign in first"})
                 return
-            tier = tier_of(cfg["specialists"], prof["email"])
-            review, err = validate_rating(body, tier)
+            tier = tier_of(cfg["specialists"], prof)
+            review, err = validate_rating(body)
             if err:
                 self._send(400, {"error": err})
                 return
             data = review["data"]
+            if not reviewable(data["dataset"], tier):
+                self._send(403, {"error": REVIEW_CLOSED})
+                return
             items = load_items(cfg["dataset_root"], cfg["state"], data["dataset"]) or []
             item = next((i for i in items if i.get("id") == data["item_id"]), None)
             if item is None:

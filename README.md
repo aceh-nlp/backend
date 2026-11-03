@@ -23,8 +23,8 @@ python3 server.py
 ```
 
 Optional: `ACEH_GPU_URL` + `ACEH_GPU_TOKEN` (inference), `ACEH_GOOGLE_CLIENT_ID`
-(Google Sign-In), `ACEH_SPECIALISTS` (comma-separated specialist emails; everyone
-else reviews as `everyday`; restart to apply changes), `ACEH_GENERATE_PER_IP` and
+(Google Sign-In), `ACEH_SPECIALISTS` (comma-separated emails allowed to review, after
+Google sign-in; restart to apply changes), `ACEH_GENERATE_PER_IP` and
 `ACEH_GENERATE_DAILY_CAP` (public model demo limits, default 20/hour per IP and
 500/day), `ACEH_PORT` (default 8766, loopback only).
 

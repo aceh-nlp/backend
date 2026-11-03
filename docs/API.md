@@ -14,24 +14,24 @@ Evaluators sign in; every rating and upload records who did it.
 - With `ACEH_GOOGLE_CLIENT_ID` set, `POST /api/login` also accepts
   `{google_id_token, dialect?}`; the token is verified server-side against
   Google's tokeninfo endpoint (audience + verified email).
-- `GET /api/me` → `{profile, tier}`. `tier` is `specialist` if the email is in
-  `$ACEH_SPECIALISTS`, otherwise `everyday`. It is checked on every request and
-  is not stored in the token.
+- `GET /api/me` → `{profile, tier}`. `tier` is `specialist` only if the email is
+  in `$ACEH_SPECIALISTS` and the person signed in with Google; otherwise
+  `everyday`. It is checked on every request and is not stored in the token.
 
 Email sign-in is identification, not authentication: fine for a trusted circle
-of speakers; switch on Google Sign-In for verified identities.
+of speakers. It never grants the specialist tier.
 
 ## Review
 
 - `GET /api/datasets` → `{datasets: [{dataset, rows, origin}]}` — every JSONL
   under the dataset repo's `data/` whose rows all have `id`, plus uploads.
-- `GET /api/items?dataset=X&limit=N` (auth) → `{items, remaining, total}` —
-  items this evaluator has not rated yet. Blinded: `model`, `revision`,
+  `layer_1_*` is left out: it is the result of review, not its input.
+- `GET /api/items?dataset=X&limit=N` (specialist) → `{items, remaining, total}` —
+  items this reviewer has not reviewed yet. Blinded: `model`, `revision`,
   `run_id`, `source`, `generator`, `producer` fields are stripped.
-- `POST /api/ratings` (auth) — `{dataset, item_id, ...}` plus the fields for the
-  reviewer's tier; anything else is a 400, and an unknown item is a 404:
-  - `specialist`: `score: 1..5`, `correction?`, `annotation?`
-  - `everyday`: `vote: 1 | -1`
+- `POST /api/ratings` (specialist) — `{dataset, item_id, score: 1..5, correction?,
+  annotation?}`. Anything else is a 400, an unknown item is a 404, and anyone who
+  isn't a specialist gets a 403 until everyday review opens.
 
   Appended to `$ACEH_STATE/ratings/<dataset>.jsonl` as one record with three
   fields. `data.sha256` is the hash of the row as reviewed. Re-reviewing an item
@@ -39,8 +39,8 @@ of speakers; switch on Google Sign-In for verified identities.
 
   ```json
   {"data": {"dataset": "...", "item_id": "s001", "sha256": "..."},
-   "reviewer": {"email": "...", "dialect": "...", "tier": "everyday"},
-   "result": {"vote": 1, "ts": 1793700000}}
+   "reviewer": {"email": "...", "dialect": "...", "tier": "specialist"},
+   "result": {"score": 4, "correction": "...", "annotation": "...", "ts": 1793700000}}
   ```
 - `GET /api/export?dataset=X` with `Authorization: Bearer $ACEH_ADMIN_TOKEN`
   → `{dataset, ratings: [...]}`: every record as stored, including reviewer
