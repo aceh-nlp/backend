@@ -1,6 +1,7 @@
 """End-to-end tests against a live handler on a temp state dir — no network, no GPU."""
 import json
 import queue
+import re
 import tempfile
 import threading
 import time
@@ -16,8 +17,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import storage  # noqa: E402
 from server import (ANON_MAX_TOKENS, CODE_ATTEMPTS, CODE_TTL, SIGN_IN, TOKEN_TTL,  # noqa: E402
-                    GenerateLimiter, ReviewLimiter, SignInCodes, build_handler, make_token, read_token,
-                    reviewable, row_sha256, send_code_email, signed_in, tier_of,
+                    WELCOME_SUBJECT, GenerateLimiter, ReviewLimiter, SignInCodes, Welcomes, build_handler, make_token, read_token,
+                    reviewable, row_sha256, send_email, signed_in, tier_of,
                     validate_rating)
 
 SECRET = "test-secret"
@@ -116,29 +117,40 @@ class SignInCodeTests(unittest.TestCase):
         self.assertTrue(codes.reserve("c@example.com", "ip", now=self.now + 86400))
 
 
-class SendCodeEmailTests(unittest.TestCase):
-    CFG = {"cf_account_id": "acct", "cf_email_token": "tok", "mail_from": "login@aceh-nlp.net"}
+class SendEmailTests(unittest.TestCase):
+    CFG = {"cf_account_id": "acct", "cf_email_token": "tok", "mail_from": "login@aceh-nlp.net",
+           "mail_reply_to": "hello@aceh-nlp.net"}
 
     def _send(self, reply):
         resp = unittest.mock.MagicMock()
         resp.__enter__.return_value.read.return_value = json.dumps(reply).encode()
         with unittest.mock.patch("urllib.request.urlopen", return_value=resp) as call:
-            send_code_email(self.CFG, "spec@example.com", "123456")
+            send_email(self.CFG, "spec@example.com", "Subject", "Body")
         return call.call_args[0][0]
 
     def test_request(self):
         req = self._send({"success": True})
         self.assertTrue(req.full_url.endswith("/accounts/acct/email/sending/send"))
         self.assertEqual(req.get_header("Authorization"), "Bearer tok")
-        body = json.loads(req.data)
-        self.assertEqual((body["to"], body["from"]), ("spec@example.com", "login@aceh-nlp.net"))
-        self.assertIn("123456", body["text"])
-        self.assertNotIn("123456", body["subject"])
+        self.assertEqual(json.loads(req.data), {
+            "to": "spec@example.com", "from": "login@aceh-nlp.net",
+            "reply_to": "hello@aceh-nlp.net", "subject": "Subject", "text": "Body"})
 
     def test_refusal_raises(self):
         for reply in ({"success": False, "errors": [{"message": "no"}]}, ["odd"]):
             with self.assertRaises(ValueError):
                 self._send(reply)
+
+
+class WelcomesTests(unittest.TestCase):
+    def test_once_per_address_even_after_a_restart(self):
+        with tempfile.TemporaryDirectory() as state:
+            welcomes = Welcomes("s", state)
+            self.assertTrue(welcomes.first_time("a@example.com"))
+            self.assertFalse(welcomes.first_time("a@example.com"))
+            self.assertTrue(welcomes.first_time("b@example.com"))
+            self.assertFalse(Welcomes("s", state).first_time("a@example.com"))
+            self.assertNotIn("example.com", (Path(state) / "welcomed.jsonl").read_text())
 
 
 class RatingValidationTests(unittest.TestCase):
@@ -178,13 +190,18 @@ class TierTests(unittest.TestCase):
 class ApiTests(unittest.TestCase):
     ROW_S1 = {"id": "s1", "ace_draft": "Peue haba?", "model": "secret-model"}
 
-    mail_fails = False
+    mail_fails = welcome_fails = False
 
     @classmethod
-    def _send_mail(cls, _cfg, to, code):
+    def _send_mail(cls, _cfg, to, subject, text):
+        if subject == WELCOME_SUBJECT:
+            if cls.welcome_fails:
+                raise ValueError("mail API returned 500")
+            cls.welcomed.put((to, text))
+            return
         if cls.mail_fails:
             raise ValueError("mail API returned 403")
-        cls.mail.put((to, code))
+        cls.mail.put((to, re.search(r"[0-9]{6}", text).group()))
 
     @classmethod
     def setUpClass(cls):
@@ -198,7 +215,7 @@ class ApiTests(unittest.TestCase):
         with open(root / "dataset/data/layer_1_specialist/checked.jsonl", "w") as f:
             f.write(json.dumps({"id": "c1", "ace": "Peue haba?"}) + "\n")
         cls.state = root / "state"
-        cls.mail = queue.Queue()
+        cls.mail, cls.welcomed = queue.Queue(), queue.Queue()
         cfg = {"state": str(cls.state), "dataset_root": str(root / "dataset"),
                "auth_secret": SECRET, "admin_token": ADMIN,
                "gpu_url": None, "gpu_token": None,
@@ -272,6 +289,31 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(me["tier"], "everyday")
         status, _ = self._call("POST", "/api/login/verify", {"challenge": challenge, "code": code})
         self.assertEqual(status, 401)
+
+    def _sign_in(self, email):
+        _, data = self._call("POST", "/api/login/start", {"email": email})
+        _, code = self.mail.get(timeout=5)
+        return self._call("POST", "/api/login/verify", {"challenge": data["challenge"], "code": code})
+
+    def test_welcome_comes_after_a_real_sign_in_only(self):
+        self._call("POST", "/api/login/start", {"email": "asked-only@example.com"})
+        self.mail.get(timeout=5)
+        status, _ = self._sign_in("signed-in@example.com")
+        self.assertEqual(status, 200)
+        seen = []  # other tests' sign-ins share this queue
+        while not seen or seen[-1][0] != "signed-in@example.com":
+            seen.append(self.welcomed.get(timeout=5))
+        self.assertNotIn("asked-only@example.com", [to for to, _ in seen])
+        self.assertIn("https://aceh-nlp.net/evaluate/", seen[-1][1])
+
+    def test_failed_welcome_does_not_stop_sign_in(self):
+        type(self).welcome_fails = True
+        try:
+            status, data = self._sign_in("nowelcome@example.com")
+        finally:
+            type(self).welcome_fails = False
+        self.assertEqual(status, 200)
+        self.assertIn("token", data)
 
     def test_second_request_for_an_email_waits(self):
         self.assertEqual(self._call("POST", "/api/login/start", {"email": "w@example.com"})[0], 200)

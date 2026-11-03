@@ -19,6 +19,10 @@ and upload records who did it.
   or 401. A code lasts 10 minutes, works once and only with its own challenge, and the
   challenge ends after 5 wrong tries. Codes live in memory, hashed, so a restart means
   asking for a new one.
+- The first verified sign-in from an address also sends one welcome email. It runs in the
+  background, so a failure can't stop the sign-in. `$ACEH_STATE/welcomed.jsonl` keeps keyed
+  hashes of those addresses, not the addresses. Replies to all emails go to
+  `$ACEH_MAIL_REPLY_TO`.
 - The token is an HMAC-signed profile; send it as `Authorization: Bearer <token>`. It lasts
   30 days. Tokens from the earlier email and Google sign-ins are refused.
 - `GET /api/me` → `{profile, tier}`. `tier` is `specialist` if the email is in

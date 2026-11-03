@@ -14,6 +14,7 @@ Env:
   ACEH_CF_ACCOUNT_ID     Cloudflare account that sends sign-in codes
   ACEH_CF_EMAIL_TOKEN    Cloudflare API token with Email Sending: Edit
   ACEH_MAIL_FROM         sender, default login@aceh-nlp.net
+  ACEH_MAIL_REPLY_TO     where replies go, default hello@aceh-nlp.net
   ACEH_MAIL_DAILY_CAP    sign-in emails per UTC day (default 100)
   ACEH_MAIL_PER_IP       sign-in emails per visitor per hour (default 30)
   ACEH_REVIEWS_PER_PERSON  reviews per person per UTC day (default 500)
@@ -166,17 +167,30 @@ class SignInCodes:
             return None
 
 
-def send_code_email(cfg, to, code):
-    minutes = CODE_TTL // 60
+WELCOME_SUBJECT = "Welcome to Aceh NLP / Selamat datang di Aceh NLP"
+WELCOME_TEXT = """Thank you for joining. Aceh NLP is a community project to keep Acehnese alive in the tools people use.
+
+You can help by scoring and correcting sentences at https://aceh-nlp.net/evaluate/. They are AI drafts, so please fix them the way you would really say them.
+
+Questions, or want to help in another way? Just reply to this email.
+
+- Aceh NLP
+
+---
+
+Terima kasih sudah bergabung. Aceh NLP adalah proyek komunitas untuk menjaga bahasa Aceh tetap hidup dalam alat yang digunakan orang.
+
+Anda bisa membantu dengan menilai dan mengoreksi kalimat di https://aceh-nlp.net/evaluate/. Kalimat-kalimat itu adalah draf AI, jadi perbaiki seperti yang benar-benar Anda ucapkan.
+
+Ada pertanyaan, atau ingin membantu dengan cara lain? Balas saja email ini.
+"""
+
+
+def send_email(cfg, to, subject, text):
     req = urllib.request.Request(
         f"{CF_API}/accounts/{cfg['cf_account_id']}/email/sending/send",
-        data=json.dumps({
-            "to": to, "from": cfg["mail_from"], "subject": "Aceh NLP sign-in code",
-            "text": f"Your Aceh NLP sign-in code is {code}. It expires in {minutes} minutes.\n"
-                    f"Kode masuk Aceh NLP Anda: {code}. Kode berlaku {minutes} menit.\n\n"
-                    "If you didn't ask for this, you can ignore this email.\n"
-                    "Jika Anda tidak memintanya, abaikan email ini.\n",
-        }).encode(),
+        data=json.dumps({"to": to, "from": cfg["mail_from"], "reply_to": cfg["mail_reply_to"],
+                         "subject": subject, "text": text}).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {cfg['cf_email_token']}"},
         method="POST")
@@ -187,6 +201,42 @@ def send_code_email(cfg, to, code):
         raise ValueError(f"mail API returned {exc.code}: {exc.read()[:300]!r}")
     if not (isinstance(result, dict) and result.get("success")):
         raise ValueError(f"mail API refused: {str(result)[:300]}")
+
+
+def code_email_text(code):
+    minutes = CODE_TTL // 60
+    return (f"Your Aceh NLP sign-in code is {code}. It expires in {minutes} minutes.\n"
+            f"Kode masuk Aceh NLP Anda: {code}. Kode berlaku {minutes} menit.\n\n"
+            "If you didn't ask for this, you can ignore this email.\n"
+            "Jika Anda tidak memintanya, abaikan email ini.\n")
+
+
+class Welcomes:
+    """Who has had the welcome email, kept as keyed hashes rather than addresses."""
+
+    def __init__(self, secret, state_dir):
+        self.secret, self.path = secret, Path(state_dir) / "welcomed.jsonl"
+        self.seen = {r.get("email_hash") for r in storage.read_all(self.path)}
+        self.lock = threading.Lock()
+
+    def first_time(self, email):
+        """True once per address, even across restarts."""
+        digest = hmac.new(self.secret.encode(), email.encode(), hashlib.sha256).hexdigest()
+        with self.lock:
+            if digest in self.seen:
+                return False
+            storage.append(self.path, {"email_hash": digest, "ts": int(time.time())})
+            self.seen.add(digest)
+            return True
+
+
+def welcome(cfg, welcomes, email):
+    """Runs on its own thread: a welcome that fails must not hold up signing in."""
+    try:
+        if welcomes.first_time(email):
+            cfg.get("send_mail", send_email)(cfg, email, WELCOME_SUBJECT, WELCOME_TEXT)
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        print(f"welcome email failed: {exc}", flush=True)
 
 
 # ---------- datasets ----------
@@ -352,6 +402,7 @@ def build_handler(cfg):
     secret = cfg["auth_secret"]
     limiter = GenerateLimiter(cfg.get("generate_per_ip", 20), cfg.get("generate_daily_cap", 500))
     codes = SignInCodes(secret, cfg.get("mail_daily_cap", 100), cfg.get("mail_per_ip", 30))
+    welcomes = Welcomes(secret, cfg["state"])
     review_limit = ReviewLimiter(cfg.get("reviews_per_person", 500), cfg.get("reviews_daily_cap", 5000))
 
     class Handler(BaseHTTPRequestHandler):
@@ -364,7 +415,7 @@ def build_handler(cfg):
             self.wfile.write(body)
 
         def log_message(self, fmt, *args):
-            print(f"{self.address_string()} {fmt % args}")
+            print(f"{self.address_string()} {fmt % args}", flush=True)
 
         def _body(self):
             limit = MAX_UPLOAD_BODY if self.path == "/api/uploads" else MAX_BODY
@@ -489,7 +540,8 @@ def build_handler(cfg):
                 return
             code = f"{secrets.randbelow(10**6):06d}"
             try:
-                cfg.get("send_mail", send_code_email)(cfg, email, code)
+                cfg.get("send_mail", send_email)(cfg, email, "Aceh NLP sign-in code",
+                                                 code_email_text(code))
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 print(f"sign-in email failed: {exc}", flush=True)
                 self._send(502, {"error": "The email could not be sent; try again later"})
@@ -507,6 +559,7 @@ def build_handler(cfg):
             profile = {"email": email, "name": clean_text(body.get("name"))[:200],
                        "dialect": clean_text(body.get("dialect"))[:100],
                        "method": SIGN_IN, "iat": int(time.time())}
+            threading.Thread(target=welcome, args=(cfg, welcomes, email), daemon=True).start()
             self._send(200, {"token": make_token(secret, profile), "profile": profile})
 
         def _rate(self, body):
@@ -628,6 +681,7 @@ def config_from_env():
            "cf_account_id": os.environ.get("ACEH_CF_ACCOUNT_ID"),
            "cf_email_token": os.environ.get("ACEH_CF_EMAIL_TOKEN"),
            "mail_from": os.environ.get("ACEH_MAIL_FROM", "login@aceh-nlp.net"),
+           "mail_reply_to": os.environ.get("ACEH_MAIL_REPLY_TO", "hello@aceh-nlp.net"),
            "mail_daily_cap": int(os.environ.get("ACEH_MAIL_DAILY_CAP", "100")),
            "mail_per_ip": int(os.environ.get("ACEH_MAIL_PER_IP", "30")),
            "reviews_per_person": int(os.environ.get("ACEH_REVIEWS_PER_PERSON", "500")),

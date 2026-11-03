@@ -27,7 +27,7 @@ token needs Email Sending: Edit). Without them every sign-in gets a 503.
 
 Optional: `ACEH_GPU_URL` + `ACEH_GPU_TOKEN` (inference), `ACEH_SPECIALISTS`
 (comma-separated emails labelled specialist, who can also upload; restart to apply
-changes), `ACEH_MAIL_FROM` (default `login@aceh-nlp.net`), `ACEH_MAIL_DAILY_CAP` (default
+changes), `ACEH_MAIL_FROM` (default `login@aceh-nlp.net`), `ACEH_MAIL_REPLY_TO` (default `hello@aceh-nlp.net`), `ACEH_MAIL_DAILY_CAP` (default
 100), `ACEH_MAIL_PER_IP` (default 30 an hour), `ACEH_REVIEWS_PER_PERSON` and `ACEH_REVIEWS_DAILY_CAP` (default 500 and 5000 a
 day), `ACEH_GENERATE_PER_IP` and
 `ACEH_GENERATE_DAILY_CAP` (public model demo limits, default 20/hour per IP and
