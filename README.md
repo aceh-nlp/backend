@@ -1,11 +1,11 @@
-# aceh-nlp-backend
+# aceh-nlp/backend
 
 **API only.** The single hub between the other three repositories: it serves
-data from [aceh-nlp-dataset](https://github.com/aceh-nlp/aceh-nlp-dataset),
+data from [aceh-nlp-dataset](https://github.com/aceh-nlp/dataset),
 stores evaluator ratings and uploads as append-only JSONL, and proxies
-inference to [aceh-nlp-gpu](https://github.com/aceh-nlp/aceh-nlp-gpu) (open to
+inference to [aceh-nlp-gpu](https://github.com/aceh-nlp/gpu) (open to
 anyone, rate-limited). The UI
-lives in [aceh-nlp-frontend](https://github.com/aceh-nlp/aceh-nlp-frontend);
+lives in [aceh-nlp-frontend](https://github.com/aceh-nlp/frontend);
 this repository serves no HTML.
 
 Pure Python standard library; no database (JSONL state only, no SQLite).
@@ -16,7 +16,7 @@ who gave it. Contract: [docs/API.md](docs/API.md).
 
 ```sh
 ACEH_STATE=/path/state \
-ACEH_DATASET_ROOT=/path/aceh-nlp-dataset \
+ACEH_DATASET_ROOT=/path/dataset \
 ACEH_AUTH_SECRET=$(openssl rand -hex 32) \
 ACEH_ADMIN_TOKEN=$(openssl rand -hex 32) \
 python3 server.py
